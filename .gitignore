@@ -17,3 +17,6 @@ src/library/M4bTool/Command/Plugins/
 fummel.php
 m4b-tool_debug.log
 nbproject/private/
+result
+.envrc
+.direnv
