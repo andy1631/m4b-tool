@@ -1,104 +1,108 @@
-{ pkgs, lib, stdenv, fetchFromGitHub, fetchurl
-, runtimeShell
-, php82, php82Packages
-, ffmpeg_5-headless, mp4v2, fdk_aac, fdk-aac-encoder
-, useLibfdkFfmpeg ? false
+{
+  pkgs ? import <nixpkgs> { },
+  lib,
+  useLibfdk ? false,
 }:
 
 let
-  m4bToolPhp = php82.buildEnv {
-    extensions = ({ enabled, all }: enabled ++ (with all; [
-      dom mbstring tokenizer xmlwriter openssl
-    ]));
+  # Override the mp4v2 package to use the repository from GitHub.
+  customMp4v2 = pkgs.mp4v2.overrideAttrs (old: rec {
+    src = pkgs.fetchFromGitHub {
+      owner = "sandreas";
+      repo = "mp4v2";
+      rev = "master";
+      sha256 = "sha256-AOkFObeANF5Vg2vAY4x7aluFJsNlAKJTQXvV3ZJgatE=";
+    };
+  });
 
+  m4bToolFfmpeg =
+    if useLibfdk then
+      pkgs.ffmpeg-headless.overrideAttrs (prev: rec {
+        configureFlags = prev.configureFlags ++ [
+          "--enable-libfdk-aac"
+          "--enable-nonfree"
+        ];
+        buildInputs = prev.buildInputs ++ [
+          pkgs.fdk_aac
+        ];
+      })
+    else
+      pkgs.ffmpeg-headless;
+
+  m4bToolPhp = pkgs.php82.buildEnv {
+    extensions = (
+      { enabled, all }:
+      enabled
+      ++ (with all; [
+        dom
+        mbstring
+        tokenizer
+        xmlwriter
+        openssl
+      ])
+    );
     extraConfig = ''
       date.timezone = UTC
       error_reporting = E_ALL & ~E_STRICT & ~E_NOTICE & ~E_DEPRECATED
     '';
   };
 
-  m4bToolPhpPackages = php82Packages;
-
-  m4bToolComposer = pkgs.callPackage ./composer.nix {
-    php = m4bToolPhp;
-    phpPackages = m4bToolPhpPackages;
-  };
-
-  m4bToolFfmpeg = if useLibfdkFfmpeg then ffmpeg_5-headless.overrideAttrs (prev: rec {
-    configureFlags = prev.configureFlags ++ [
-      "--enable-libfdk-aac"
-      "--enable-nonfree"
-    ];
-    buildInputs = prev.buildInputs ++ [
-      fdk_aac
-    ];
-  }) else ffmpeg_5-headless;
 in
-m4bToolComposer.overrideAttrs (prev: rec {
+m4bToolPhp.buildComposerProject rec {
   pname = "m4b-tool";
-  version = "0.5";
-
-  buildInputs = [
-    m4bToolPhp m4bToolFfmpeg mp4v2 fdk-aac-encoder
+  version = "v0.5.2";
+  src = ./.;
+  vendorHash = "sha256-Ycl1PLa2v00qBVbNEBBYtOVFuJoXEWN2DuxgIdB/CA8=";
+  meta.mainProgram = "m4b-tool";
+  composerNoDev = false; # Enable dev dependencies (phpunit etc.)
+  buildInputs = with pkgs; [
+    m4bToolPhp
+    m4bToolFfmpeg
+    customMp4v2
+    fdk-aac-encoder
   ];
-
-  nativeBuildInputs = [
-    m4bToolPhp m4bToolPhpPackages.composer
-  ];
-
   postInstall = ''
-    # Fix the version
-    sed -i 's!@package_version@!${version}!g' bin/m4b-tool.php
-  '';
+        mkdir -p $out/bin
+        # Version injection: replace the @package_version@ placeholder with the actual version.
+        sed -i 's!@package_version@!${version}!g' $out/share/php/m4b-tool/bin/m4b-tool.php
 
-  postFixup = ''
-    # Wrap it
-    rm -rf $out/bin
-    mkdir -p $out/bin
-
-    # makeWrapper fails for this on macOS
-    cat >$out/bin/m4b-tool <<EOF
-    #!${runtimeShell}
+        # Create a wrapper script that sets PATH to include our chosen ffmpeg-headless and mp4v2.
+        cat > $out/bin/m4b-tool <<EOF
+    #!/bin/sh
     export PATH=${lib.makeBinPath buildInputs}
-    export M4B_TOOL_DISABLE_TONE=true
-    exec ${m4bToolPhp}/bin/php $out/share/php/sandreas-m4b-tool/bin/m4b-tool.php "\$@"
+    exec ${m4bToolPhp}/bin/php $out/share/php/m4b-tool/bin/m4b-tool.php "\$@"
     EOF
-    chmod +x $out/bin/m4b-tool
+        chmod +x $out/bin/m4b-tool
   '';
-
   doInstallCheck = true;
+  installCheckPhase =
+    let
+      exampleAudiobook = pkgs.fetchurl {
+        name = "audiobook";
+        url = "https://archive.org/download/M4bCollectionOfLibrivoxAudiobooks/ArtOfWar-64kb.m4b";
+        sha256 = "00cvbk2a4iyswfmsblx2h9fcww2mvb4vnlf22gqgi1ldkw67b5w7";
+      };
+    in
+    ''
+      ${m4bToolPhp}/bin/php vendor/bin/phpunit tests
 
-  installCheckPhase = let
-    exampleAudiobook = fetchurl {
-      name = "audiobook";
-      url = "https://archive.org/download/M4bCollectionOfLibrivoxAudiobooks/ArtOfWar-64kb.m4b";
-      sha256 = "00cvbk2a4iyswfmsblx2h9fcww2mvb4vnlf22gqgi1ldkw67b5w7";
-    };
-  in ''
-    # Run the unit test suite
-    php vendor/bin/phpunit tests
-
-    # Check that the audiobook split actually works
-    (
+      # Check that the audiobook splitting works.
       mkdir -p audiobook
       cd audiobook
-
       cp ${exampleAudiobook} audiobook.m4b
       $out/bin/m4b-tool split -vvv -o . audiobook.m4b
-
       if ! grep -q 'The Nine Situations' audiobook.chapters.txt; then
+        echo "Chapter split test failed!"
         exit 1
       fi
-
       if [ ! -f '006-11 The Nine Situations.m4b' ]; then
+        echo "Expected output file not found!"
         exit 1
       fi
-    )
-    rm -rf audiobook
-  '';
-
+      cd ..
+      rm -rf audiobook
+    '';
   passthru = {
     dependencies = buildInputs;
-    devDependencies = nativeBuildInputs;
   };
-})
+}
